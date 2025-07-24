@@ -193,34 +193,31 @@ def create_job_text(
     )
 
 
-def start_tuning_container_diffusion(job: DiffusionJob):
+def start_tuning_container_diffusion(job: DiffusionJob, advanced_config: dict = None):
     logger.info("=" * 80)
     logger.info("STARTING THE DIFFUSION TUNING CONTAINER")
     logger.info("=" * 80)
 
-    config_path = os.path.join(cst.CONFIG_DIR, f"{job.job_id}.toml")
+    config_filename = f"{job.job_id}.toml"
+    config_path = os.path.join(cst.CONFIG_DIR, config_filename)
 
     config = _load_and_modify_config_diffusion(job)
+    
+    # Apply advanced configuration if provided
+    if advanced_config:
+        logger.info("Applying advanced diffusion configuration optimizations")
+        config.update(advanced_config)
+        logger.info(f"Advanced diffusion config applied: {advanced_config}")
+    
     save_config_toml(config, config_path)
 
     logger.info(config)
-    if job.model_type == ImageModelType.FLUX:
-        logger.info(f"Downloading flux unet from {job.model}")
-        flux_unet_path = download_flux_unet(job.model)
-
-    prepare_dataset(
-        training_images_zip_path=job.dataset_zip,
-        training_images_repeat=(
-            cst.DIFFUSION_SDXL_REPEATS if job.model_type == ImageModelType.SDXL
-            else cst.DIFFUSION_FLUX_REPEATS
-        ),
-        instance_prompt=cst.DIFFUSION_DEFAULT_INSTANCE_PROMPT,
-        class_prompt=cst.DIFFUSION_DEFAULT_CLASS_PROMPT,
-        job_id=job.job_id,
-    )
 
     docker_env = DockerEnvironmentDiffusion(
-        huggingface_token=cst.HUGGINGFACE_TOKEN, wandb_token=cst.WANDB_TOKEN, job_id=job.job_id, base_model=job.model_type.value
+        huggingface_token=cst.HUGGINGFACE_TOKEN,
+        wandb_token=cst.WANDB_TOKEN,
+        job_id=job.job_id,
+        base_model=job.model,
     ).to_dict()
     logger.info(f"Docker environment: {docker_env}")
 
@@ -229,24 +226,23 @@ def start_tuning_container_diffusion(job: DiffusionJob):
 
         volume_bindings = {
             os.path.abspath(cst.CONFIG_DIR): {
-                "bind": "/dataset/configs",
+                "bind": "/workspace/kohya_ss/configs",
                 "mode": "rw",
             },
             os.path.abspath(cst.OUTPUT_DIR): {
-                "bind": "/dataset/outputs",
-                "mode": "rw",
-            },
-            os.path.abspath(cst.DIFFUSION_DATASET_DIR): {
-                "bind": "/dataset/images",
+                "bind": "/workspace/kohya_ss/outputs",
                 "mode": "rw",
             },
         }
 
-        if job.model_type == ImageModelType.FLUX:
-            volume_bindings[os.path.dirname(flux_unet_path)] =  {
-                "bind": cst.CONTAINER_FLUX_PATH,
-                "mode": "rw",
-            }
+        dataset_dir = os.path.dirname(os.path.abspath(job.dataset))
+        logger.info(dataset_dir)
+        volume_bindings[dataset_dir] = {
+            "bind": "/workspace/input_data",
+            "mode": "ro",
+        }
+
+        prepare_dataset(job.dataset, job.model_type)
 
         container = docker_client.containers.run(
             image=cst.MINER_DOCKER_IMAGE_DIFFUSION,
@@ -256,10 +252,10 @@ def start_tuning_container_diffusion(job: DiffusionJob):
             device_requests=[docker.types.DeviceRequest(count=1, capabilities=[["gpu"]])],
             detach=True,
             tty=True,
+            command=["/bin/bash", "-c", f"cd /workspace/kohya_ss && accelerate launch --num_cpu_threads_per_process 8 train_network.py --config_file /workspace/kohya_ss/configs/{config_filename}"]
         )
 
-        # Use the shared stream_logs function
-        stream_logs(container)
+        last_logs = stream_logs(container)
 
         result = container.wait()
 
@@ -267,17 +263,22 @@ def start_tuning_container_diffusion(job: DiffusionJob):
             raise DockerException(f"Container exited with non-zero status code: {result['StatusCode']}")
 
     except Exception as e:
-        logger.error(f"Error processing job: {str(e)}")
+        logger.error(f"Error processing diffusion job: {str(e)}")
         raise
 
     finally:
+        repo = config.get("output_name", None)
+        if repo:
+            hf_api = HfApi(token=cst.HUGGINGFACE_TOKEN)
+            hf_api.update_repo_visibility(repo_id=repo, private=False, token=cst.HUGGINGFACE_TOKEN)
+            logger.info(f"Successfully made repository {repo} public")
+
         if "container" in locals():
-            container.remove(force=True)
-
-        train_data_path = f"{cst.DIFFUSION_DATASET_DIR}/{job.job_id}"
-
-        if os.path.exists(train_data_path):
-            shutil.rmtree(train_data_path)
+            try:
+                container.remove(force=True)
+                logger.info("Container removed")
+            except Exception as e:
+                logger.warning(f"Failed to remove container: {e}")
 
 
 def _dpo_format_prompt(row, format_str):
@@ -411,7 +412,7 @@ def _adapt_columns_for_dataset(job: TextJob):
         _adapt_columns_for_grpo_dataset(job.dataset, job.dataset_type)
 
 
-def start_tuning_container(job: TextJob):
+def start_tuning_container(job: TextJob, advanced_config: dict = None):
     logger.info("=" * 80)
     logger.info("STARTING THE TUNING CONTAINER")
     logger.info("=" * 80)
@@ -429,6 +430,13 @@ def start_tuning_container(job: TextJob):
         job.job_id,
         job.expected_repo_name,
     )
+    
+    # Apply advanced configuration if provided
+    if advanced_config:
+        logger.info("Applying advanced configuration optimizations")
+        config.update(advanced_config)
+        logger.info(f"Advanced config applied: {advanced_config}")
+    
     save_config(config, config_path)
 
     logger.info(config)

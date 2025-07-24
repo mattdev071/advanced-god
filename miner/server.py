@@ -7,7 +7,6 @@ from fiber.logging_utils import get_logger
 
 from miner.config import get_worker_config
 from miner.endpoints import tuning
-from miner.endpoints import advanced_tuning
 from miner.dependencies import get_worker_config_dep
 
 
@@ -19,14 +18,14 @@ async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     logger.info("Starting advanced miner server...")
     
-    # Initialize advanced worker config
+    # Initialize worker config
     worker_config = get_worker_config()
-    logger.info(f"Advanced training worker initialized with {worker_config.trainer.max_concurrent_jobs} concurrent jobs")
+    logger.info(f"Advanced training worker initialized with {worker_config.trainer.get_max_concurrent_jobs()} concurrent jobs")
     
     yield
     
     logger.info("Shutting down advanced miner server...")
-    # Shutdown advanced training worker
+    # Shutdown training worker
     worker_config.trainer.shutdown()
 
 
@@ -49,23 +48,36 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     
-    # Include standard endpoints
-    app.include_router(tuning.router, prefix="/v1", tags=["standard"])
+    # Include standard endpoints (using factory_router)
+    standard_router = tuning.factory_router()
+    app.include_router(standard_router, prefix="/v1", tags=["standard"])
     
-    # Include advanced endpoints
-    app.include_router(advanced_tuning.router, prefix="/v1/advanced", tags=["advanced"])
+    # Add performance monitoring endpoints
+    @app.get("/v1/status")
+    async def get_status():
+        """Get miner status and performance stats"""
+        worker_config = get_worker_config()
+        stats = worker_config.trainer.get_performance_stats()
+        return {
+            "status": "running",
+            "active_jobs": worker_config.trainer.get_active_jobs_count(),
+            "max_concurrent_jobs": worker_config.trainer.get_max_concurrent_jobs(),
+            "performance_stats": stats
+        }
     
-    # Add advanced status endpoint
-    @app.get("/v1/advanced/status")
-    async def get_advanced_status():
-        """Get advanced miner status"""
-        return await advanced_tuning.get_advanced_status()
-    
-    # Add performance report endpoint
-    @app.get("/v1/advanced/performance-report")
-    async def export_performance_report():
-        """Export performance report"""
-        return await advanced_tuning.export_performance_report()
+    @app.get("/v1/performance-report")
+    async def get_performance_report():
+        """Get detailed performance report"""
+        worker_config = get_worker_config()
+        stats = worker_config.trainer.get_performance_stats()
+        return {
+            "performance_report": stats,
+            "worker_info": {
+                "active_jobs": worker_config.trainer.get_active_jobs_count(),
+                "max_concurrent_jobs": worker_config.trainer.get_max_concurrent_jobs(),
+                "queue_size": worker_config.trainer.job_queue.qsize()
+            }
+        }
     
     return app
 

@@ -185,9 +185,10 @@ async def task_offer(
 ) -> MinerTaskResponse:
     try:
         logger.info("An offer has come through")
-        # You will want to optimise this as a miner
         global current_job_finish_time
         current_time = datetime.now()
+        
+        # Check if we accept the task type
         if request.task_type not in [TaskType.INSTRUCTTEXTTASK, TaskType.DPOTASK, TaskType.GRPOTASK, TaskType.CHATTASK]:
             return MinerTaskResponse(
                 message=f"This endpoint only accepts text tasks: "
@@ -195,20 +196,32 @@ async def task_offer(
                 accepted=False,
             )
 
-        if "llama" not in request.model.lower():
-            return MinerTaskResponse(message="I'm not yet optimised and only accept llama-type jobs", accepted=False)
-
-        if current_job_finish_time is None or current_time + timedelta(hours=1) > current_job_finish_time:
-            if request.hours_to_complete < 13:
-                logger.info("Accepting the offer - ty snr")
-                return MinerTaskResponse(message=f"Yes. I can do {request.task_type} jobs", accepted=True)
-            else:
-                logger.info("Rejecting offer")
-                return MinerTaskResponse(message="I only accept small jobs", accepted=False)
-        else:
+        # Strategic task acceptance based on priority
+        task_priority = _calculate_task_priority(request)
+        logger.info(f"Task priority: {task_priority}")
+        
+        # Check concurrent job limits
+        active_jobs = worker_config.trainer.get_active_jobs_count()
+        max_jobs = worker_config.trainer.get_max_concurrent_jobs()
+        
+        if active_jobs >= max_jobs:
             return MinerTaskResponse(
-                message=f"Currently busy with another job until {current_job_finish_time.isoformat()}",
+                message=f"Maximum concurrent jobs ({max_jobs}) reached. Currently processing {active_jobs} jobs.",
                 accepted=False,
+            )
+        
+        # Strategic acceptance logic
+        if _should_accept_task_strategically(request, task_priority, current_time):
+            logger.info(f"Strategically accepting {request.task_type} task with priority {task_priority}")
+            return MinerTaskResponse(
+                message=f"Strategically accepted {request.task_type} task. Priority: {task_priority}, Active jobs: {active_jobs}/{max_jobs}",
+                accepted=True
+            )
+        else:
+            logger.info(f"Strategically rejecting {request.task_type} task with priority {task_priority}")
+            return MinerTaskResponse(
+                message=f"Strategically rejected {request.task_type} task. Priority: {task_priority}",
+                accepted=False
             )
 
     except ValidationError as e:
@@ -259,6 +272,87 @@ async def get_training_repo(task_type: TournamentType) -> TrainingRepoResponse:
     return TrainingRepoResponse(
         github_repo="https://github.com/rayonlabs/G.O.D", commit_hash="076e87fc746985e272015322cc91fb3bbbca2f26"
     )
+
+
+def _calculate_task_priority(request: MinerTaskOffer) -> float:
+    """Calculate task priority based on multiple factors"""
+    priority = 0.0
+    
+    # Task type priority (DPO/GRPO first for higher scores)
+    task_type_weights = {
+        TaskType.DPOTASK: 1.0,
+        TaskType.GRPOTASK: 0.9,
+        TaskType.INSTRUCTTEXTTASK: 0.7,
+        TaskType.CHATTASK: 0.6,
+    }
+    priority += task_type_weights.get(request.task_type, 0.5) * 10
+    
+    # Model size priority (larger models preferred)
+    model_size = _estimate_model_size(request.model)
+    if model_size >= 30e9:  # 30B+
+        priority += 5.0
+    elif model_size >= 13e9:  # 13B+
+        priority += 3.0
+    elif model_size >= 7e9:   # 7B+
+        priority += 1.0
+    
+    # Time efficiency (shorter jobs preferred for quick wins)
+    if request.hours_to_complete <= 3:
+        priority += 3.0
+    elif request.hours_to_complete <= 6:
+        priority += 1.0
+    elif request.hours_to_complete > 12:
+        priority -= 2.0
+    
+    # Proven model families
+    if _is_proven_model_family(request.model):
+        priority += 2.0
+    
+    return priority
+
+
+def _estimate_model_size(model_name: str) -> float:
+    """Estimate model size in parameters"""
+    size_map = {
+        "7b": 7e9, "13b": 13e9, "30b": 30e9, "70b": 70e9,
+        "1b": 1e9, "3b": 3e9, "6b": 6e9, "8b": 8e9
+    }
+    
+    for size_str, size_val in size_map.items():
+        if size_str in model_name.lower():
+            return size_val
+    
+    return 7e9  # Default to 7B
+
+
+def _is_proven_model_family(model_name: str) -> bool:
+    """Check if model is from a proven family"""
+    proven_families = ["llama", "mistral", "qwen", "gemma", "phi"]
+    return any(family in model_name.lower() for family in proven_families)
+
+
+def _should_accept_task_strategically(request: MinerTaskOffer, priority: float, current_time: datetime) -> bool:
+    """Determine if task should be accepted based on strategic criteria"""
+    global current_job_finish_time
+    
+    # High priority tasks (DPO/GRPO) are always considered
+    if priority >= 12.0:
+        return True
+    
+    # Check if we're currently busy
+    if current_job_finish_time and current_time + timedelta(hours=1) > current_job_finish_time:
+        # Only accept very high priority tasks when busy
+        return priority >= 15.0
+    
+    # Medium priority tasks need reasonable time constraints
+    if priority >= 8.0 and request.hours_to_complete <= 6:
+        return True
+    
+    # Low priority tasks only if we have capacity and they're quick
+    if priority >= 5.0 and request.hours_to_complete <= 3:
+        return True
+    
+    return False
 
 
 def factory_router() -> APIRouter:
